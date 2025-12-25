@@ -1,0 +1,210 @@
+### =========================================================
+### 0) Setup (GitHub-friendly)
+### =========================================================
+# Put ALL input files in one folder (e.g., "data/") and either:
+#  (A) open your R project in that folder, OR
+#  (B) set the path below to your folder, OR
+#  (C) paste your directory into `data_dir` (recommended for beginners)
+
+rm(list = ls()); gc()
+
+suppressPackageStartupMessages({
+  library(dplyr)
+  library(tidyr)
+  library(BGLR)
+  library(plyr)
+  # library(fastmatrix)  # not used below; keep only if you need it elsewhere
+})
+
+# ---- paste your directory here (where the CSV files are) ----
+data_dir <- "PASTE_YOUR_DIRECTORY_HERE"  # e.g., "E:/Prediction"
+# ------------------------------------------------------------
+
+# Helper to build full paths
+fp <- function(x) file.path(data_dir, x)
+
+# Quick file check (stops with a clear message if something is missing)
+needed_files <- c(
+  "GRM.GAPIT.csv",
+  "GRM_indel.csv",
+  "GRM_sv.csv",
+  "Blues.Pheno.corrected.csv",
+  "geno_70_30_splits_100x.RData"
+)
+missing_files <- needed_files[!file.exists(fp(needed_files))]
+if (length(missing_files) > 0) {
+  stop(
+    paste0(
+      "These file(s) are missing in data_dir:\n- ",
+      paste(missing_files, collapse = "\n- "),
+      "\n\nFix: put them in the folder you set in `data_dir`."
+    ),
+    call. = FALSE
+  )
+}
+
+### =========================================================
+### 1) Read Genomic Relationship Matrices
+### =========================================================
+G1 <- read.csv(fp("GRM.GAPIT.csv"), row.names = 1, check.names = FALSE) %>% as.matrix()  # SNP
+G2 <- read.csv(fp("GRM_indel.csv"), row.names = 1, check.names = FALSE) %>% as.matrix() # INDEL
+G3 <- read.csv(fp("GRM_sv.csv"), row.names = 1, check.names = FALSE) %>% as.matrix()    # SV
+
+### =========================================================
+### 2) Load and Process Phenotype
+### =========================================================
+pheno <- read.csv(fp("Blues.Pheno.corrected.csv"), check.names = FALSE)
+
+pheno <- pheno %>%
+  pivot_wider(names_from = Env, values_from = FW) %>%
+  arrange(Pedigree) %>%
+  as.data.frame()
+
+pheno <- pheno[pheno$Pedigree %in% rownames(G1), ]
+
+pheno <- pheno %>%
+  pivot_longer(cols = -Pedigree, names_to = "Env", values_to = "FW") %>%
+  arrange(Env, Pedigree) %>%
+  as.data.frame()
+
+pheno$Env <- as.factor(pheno$Env)
+pheno$Pedigree <- as.factor(pheno$Pedigree)
+
+### =========================================================
+### 3) Build Design Matrices
+### =========================================================
+ZE   <- model.matrix(~ Env - 1, data = pheno)
+ZPed <- model.matrix(~ Pedigree - 1, data = pheno)
+
+### =========================================================
+### 4) Construct Kernel Matrices
+### =========================================================
+K1   <- ZPed %*% G1 %*% t(ZPed)  # SNP
+K2   <- ZPed %*% G2 %*% t(ZPed)  # INDEL
+K3   <- ZPed %*% G3 %*% t(ZPed)  # SV
+ZEZE <- tcrossprod(ZE)           # Environment similarity
+
+K11 <- K1 * ZEZE                 # SNP x ENV
+K22 <- K2 * ZEZE                 # INDEL x ENV
+K33 <- K3 * ZEZE                 # SV x ENV
+
+### =========================================================
+### 5) Eigendecomposition
+### =========================================================
+Z_K1.eig  <- eigen(K1)
+Z_K2.eig  <- eigen(K2)
+Z_K3.eig  <- eigen(K3)
+Z_K11.eig <- eigen(K11)
+Z_K22.eig <- eigen(K22)
+Z_K33.eig <- eigen(K33)
+
+### =========================================================
+### 6) Define Multi-Kernel Models
+### =========================================================
+M1 <- list(
+  ENV = list(X = ZE, model = "BRR"),
+  SNP = list(V = Z_K1.eig$vectors, d = Z_K1.eig$values, model = "RKHS")
+)
+
+M2 <- list(
+  ENV = list(X = ZE, model = "BRR"),
+  INDEL = list(V = Z_K2.eig$vectors, d = Z_K2.eig$values, model = "RKHS")
+)
+
+M3 <- list(
+  ENV = list(X = ZE, model = "BRR"),
+  SV = list(V = Z_K3.eig$vectors, d = Z_K3.eig$values, model = "RKHS")
+)
+
+M4 <- list(
+  ENV = list(X = ZE, model = "BRR"),
+  SNP = list(V = Z_K1.eig$vectors,  d = Z_K1.eig$values,  model = "RKHS"),
+  INDEL = list(V = Z_K2.eig$vectors, d = Z_K2.eig$values, model = "RKHS"),
+  SV = list(V = Z_K3.eig$vectors,   d = Z_K3.eig$values,   model = "RKHS")
+)
+
+M5 <- list(
+  ENV = list(X = ZE, model = "BRR"),
+  SNP = list(V = Z_K1.eig$vectors,  d = Z_K1.eig$values,  model = "RKHS"),
+  SNPxENV = list(V = Z_K11.eig$vectors, d = Z_K11.eig$values, model = "RKHS"),
+  INDEL = list(V = Z_K2.eig$vectors, d = Z_K2.eig$values, model = "RKHS"),
+  INDELxENV = list(V = Z_K22.eig$vectors, d = Z_K22.eig$values, model = "RKHS"),
+  SV = list(V = Z_K3.eig$vectors,   d = Z_K3.eig$values,   model = "RKHS"),
+  SVxENV = list(V = Z_K33.eig$vectors, d = Z_K33.eig$values, model = "RKHS")
+)
+
+models <- list(M1 = M1, M2 = M2, M3 = M3, M4 = M4, M5 = M5)
+
+### =========================================================
+### 7) Run Cross-Validation Loop
+### =========================================================
+load(fp("geno_70_30_splits_100x.RData"))  # loads object: split_list
+envs <- unique(pheno$Env) %>% as.character()
+
+CV1 <- list(); CV2 <- list(); CV0 <- list(); CV00 <- list()
+index <- 1
+
+for (j in 1:100) {
+  train_ped <- split_list[[j]]$train
+  test_ped  <- split_list[[j]]$test
+
+  for (e in envs) {
+    tested_env <- setdiff(envs, e)
+
+    for (m in names(models)) {
+      df <- pheno
+      df$Y2 <- df$FW
+      df$Y2[df$Env == e | df$Pedigree %in% test_ped] <- NA
+
+      fit <- BGLR(y = df$Y2, ETA = models[[m]], nIter = 5000, burnIn = 1000, verbose = FALSE)
+      df$predicted.FW <- fit$yHat
+
+      CV1[[index]] <- df %>%
+        filter(Pedigree %in% train_ped & Env %in% tested_env) %>%
+        group_by(Env) %>%
+        summarise(cor = cor(FW, predicted.FW, use = "complete.obs"), .groups = "drop") %>%
+        mutate(model = m, iteration = j)
+
+      CV2[[index]] <- df %>%
+        filter(Pedigree %in% test_ped & Env %in% tested_env) %>%
+        group_by(Env) %>%
+        summarise(cor = cor(FW, predicted.FW, use = "complete.obs"), .groups = "drop") %>%
+        mutate(model = m, iteration = j)
+
+      CV0[[index]] <- df %>%
+        filter(Pedigree %in% train_ped & Env == e) %>%
+        group_by(Env) %>%
+        summarise(cor = cor(FW, predicted.FW, use = "complete.obs"), .groups = "drop") %>%
+        mutate(model = m, iteration = j)
+
+      CV00[[index]] <- df %>%
+        filter(Pedigree %in% test_ped & Env == e) %>%
+        group_by(Env) %>%
+        summarise(cor = cor(FW, predicted.FW, use = "complete.obs"), .groups = "drop") %>%
+        mutate(model = m, iteration = j)
+
+      cat(
+        ">>> Iteration:", j, "| Model:", m, "| Env out:", e,
+        "| CV1:", round(CV1[[index]]$cor, 2),
+        "| CV2:", round(CV2[[index]]$cor, 2),
+        "| CV0:", round(CV0[[index]]$cor, 2),
+        "| CV00:", round(CV00[[index]]$cor, 2), "\n"
+      )
+
+      index <- index + 1
+    }
+  }
+}
+
+### =========================================================
+### 8) Save Results
+### =========================================================
+CV1.out  <- ldply(CV1,  data.frame)
+CV2.out  <- ldply(CV2,  data.frame)
+CV0.out  <- ldply(CV0,  data.frame)
+CV00.out <- ldply(CV00, data.frame)
+
+write.csv(CV1.out,  fp("CV1.out.csv"),  row.names = FALSE)
+write.csv(CV2.out,  fp("CV2.out.csv"),  row.names = FALSE)
+write.csv(CV0.out,  fp("CV0.out.csv"),  row.names = FALSE)
+write.csv(CV00.out, fp("CV00.out.csv"), row.names = FALSE)
